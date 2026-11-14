@@ -25876,7 +25876,12 @@ pub fn explainWhyTypeIsNotExtern(
             .param_ty => try sema.errNote(src_loc, msg, "arrays are not allowed as a parameter type", .{}),
             else => try sema.explainWhyTypeIsNotExtern(msg, src_loc, ty.childType(zcu), .element),
         },
-        .vector => try sema.errNote(src_loc, msg, "vectors have no guaranteed in-memory representation", .{}),
+        .vector => {
+            try sema.errNote(src_loc, msg, "vectors have no guaranteed in-memory representation", .{});
+            if (position != .param_ty and position != .ret_ty) {
+                try sema.errNote(src_loc, msg, "only vectors of 8, 16, 32 or 64-bit integers or 16, 32 or 64-bit floats are extern compatible", .{});
+            }
+        },
         .optional => try sema.errNote(src_loc, msg, "non-pointer optionals have no guaranteed in-memory representation", .{}),
     }
 }

@@ -1931,3 +1931,38 @@ test "len" {
     try S.runAllTests();
     try comptime S.runAllTests();
 }
+
+test "vectors of C scalars in extern struct, union and array" {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    if (builtin.cpu.arch.isSpirv()) return error.SkipZigTest;
+
+    // Same layout as `simd_float4x4` from <simd/simd.h>.
+    const Mat4 = extern struct { columns: [4]@Vector(4, f32) };
+    const Mixed = extern struct { a: u8, v: @Vector(4, i32), b: u8 };
+    const U = extern union { v: @Vector(2, f64), a: [2]f64 };
+
+    comptime {
+        assert(@sizeOf(Mat4) == 64 and @alignOf(Mat4) == 16);
+        assert(@offsetOf(Mixed, "v") == 16 and @sizeOf(Mixed) == 48);
+        assert(@sizeOf(U) == 16);
+    }
+
+    var m: Mat4 = .{ .columns = .{
+        .{ 1, 2, 3, 4 },
+        .{ 5, 6, 7, 8 },
+        .{ 9, 10, 11, 12 },
+        .{ 13, 14, 15, 16 },
+    } };
+    _ = &m;
+    try expectEqual(@as(f32, 7), m.columns[1][2]);
+    const flat: *const [16]f32 = @ptrCast(&m);
+    for (flat, 1..) |x, i| try expectEqual(@as(f32, @floatFromInt(i)), x);
+
+    var mixed: Mixed = .{ .a = 1, .v = .{ -1, 2, -3, 4 }, .b = 2 };
+    _ = &mixed;
+    try expectEqual(@as(i32, -3), mixed.v[2]);
+
+    var u: U = .{ .v = .{ 0.5, 1.5 } };
+    _ = &u;
+    try expectEqual(@as(f64, 1.5), u.a[1]);
+}

@@ -1,0 +1,19 @@
+#zig build-obj {
+--name test -fno-emit-bin
+-Mroot=test.zig
+#}
+
+#write test.zig {
+const S = extern struct {
+    v: @Vector(4, bool),
+};
+export fn f(s: *S) void {
+    _ = s.*;
+}
+#}
+#update
+#check errors {
+test.zig:2:8: error: extern structs cannot contain fields of type '@Vector(4, bool)'
+test.zig:2:8: note: vectors have no guaranteed in-memory representation
+test.zig:2:8: note: only vectors of 8, 16, 32 or 64-bit integers or 16, 32 or 64-bit floats are extern compatible
+#}

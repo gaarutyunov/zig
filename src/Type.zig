@@ -3136,7 +3136,11 @@ pub fn validateExtern(ty: Type, position: ExternPosition, zcu: *const Zcu) bool 
 
         .vector => {
             if (zcu.getTarget().cpu.arch.isSpirv()) return true;
-            return position == .param_ty or position == .ret_ty;
+            if (position == .param_ty or position == .ret_ty) return true;
+            // Vectors of byte-sized C scalars have the same in-memory layout as
+            // C's `__attribute__((ext_vector_type(N)))` (e.g. `simd_float4`), so
+            // they may be embedded in extern structs, unions and arrays.
+            return isExternVectorElem(ty.childType(zcu), zcu);
         },
 
         .void => switch (position) {
@@ -3231,6 +3235,23 @@ pub fn validateExtern(ty: Type, position: ExternPosition, zcu: *const Zcu) bool 
         .optional => ty.isPtrLikeOptional(zcu),
     };
 }
+/// Whether a vector with element type `elem` may be embedded in an extern
+/// struct, union or array: the element must be an integer of 8, 16, 32 or 64
+/// bits, or a float of 16, 32 or 64 bits.
+pub fn isExternVectorElem(elem: Type, zcu: *const Zcu) bool {
+    return switch (elem.zigTypeTag(zcu)) {
+        .int => switch (elem.intInfo(zcu).bits) {
+            8, 16, 32, 64 => true,
+            else => false,
+        },
+        .float => switch (elem.floatBits(zcu.getTarget())) {
+            16, 32, 64 => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
 fn validateExternCallconv(cc: std.lang.CallingConvention) bool {
     return switch (cc) {
         // For now we want to authorize PTX kernel to use zig objects, even if we end up exposing the ABI.
