@@ -302,6 +302,13 @@ pub const too_many_includes: Diagnostic = .{
     .kind = .@"error",
 };
 
+pub const import_directive: Diagnostic = .{
+    .fmt = "#import is a language extension",
+    .kind = .off,
+    .opt = .@"import-preprocessor-directive-pedantic",
+    .extension = true,
+};
+
 pub const include_next: Diagnostic = .{
     .fmt = "#include_next is a language extension",
     .kind = .off,

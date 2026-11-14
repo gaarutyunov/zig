@@ -143,6 +143,7 @@ pub const Option = enum {
     undef,
     @"ignored-pragmas",
     @"gnu-include-next",
+    @"import-preprocessor-directive-pedantic",
     @"include-next-outside-header",
     @"include-next-absolute-path",
     @"enum-too-large",

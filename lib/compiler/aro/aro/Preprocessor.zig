@@ -253,6 +253,10 @@ expansion_source_loc: Source.Location = undefined,
 poisoned_identifiers: std.StringHashMapUnmanaged(void) = .empty,
 /// Map from Source.Id to macro name in the `#ifndef` condition which guards the source, if any
 include_guards: std.AutoHashMapUnmanaged(Source.Id, []const u8) = .empty,
+/// Set of sources that have been included with `#import`. Such sources are
+/// only ever entered once, regardless of whether they are later reached via
+/// `#import` or `#include`.
+imported_sources: std.AutoHashMapUnmanaged(Source.Id, void) = .empty,
 
 /// Store `keyword_define` and `keyword_undef` tokens.
 /// Used to implement preprocessor debug dump options
@@ -395,6 +399,7 @@ pub fn deinit(pp: *Preprocessor) void {
     pp.char_buf.deinit(gpa);
     pp.poisoned_identifiers.deinit(gpa);
     pp.include_guards.deinit(gpa);
+    pp.imported_sources.deinit(gpa);
     pp.top_expansion_buf.deinit(gpa);
     pp.hideset.deinit();
     for (pp.expansion_entries.items(.locs)) |locs| TokenWithExpansionLocs.free(locs, gpa);
@@ -845,6 +850,13 @@ fn preprocessExtra(pp: *Preprocessor, source: Source) MacroError!TokenWithExpans
                     },
                     .keyword_include => {
                         try pp.include(&tokenizer, .first);
+                        continue;
+                    },
+                    .keyword_import => {
+                        if (!pp.comp.langopts.objc) {
+                            try pp.err(directive_loc, .import_directive, .{});
+                        }
+                        try pp.includeExtra(&tokenizer, .first, .import);
                         continue;
                     },
                     .keyword_include_next => {
@@ -3468,6 +3480,17 @@ const EmbedArgIterator = struct {
 
 // Handle a #include directive.
 fn include(pp: *Preprocessor, tokenizer: *Tokenizer, which: Compilation.WhichInclude) MacroError!void {
+    return pp.includeExtra(tokenizer, which, .include);
+}
+
+const IncludeKind = enum {
+    /// `#include` / `#include_next`
+    include,
+    /// Objective-C style `#import`: like `#include` but the file is entered at most once.
+    import,
+};
+
+fn includeExtra(pp: *Preprocessor, tokenizer: *Tokenizer, which: Compilation.WhichInclude, kind: IncludeKind) MacroError!void {
     const first = tokenizer.nextNoWS();
     const new_source = findIncludeSource(pp, tokenizer, first, which) catch |er| switch (er) {
         error.InvalidInclude => return,
@@ -3483,6 +3506,14 @@ fn include(pp: *Preprocessor, tokenizer: *Tokenizer, which: Compilation.WhichInc
         try pp.err(loc, .too_many_includes, .{});
         return error.StopPreprocessing;
     }
+
+    if (pp.imported_sources.contains(new_source.id)) {
+        if (pp.verbose) {
+            pp.verboseLog(first, "skipping already imported file {s}", .{new_source.path});
+        }
+        return;
+    }
+    if (kind == .import) try pp.imported_sources.put(gpa, new_source.id, {});
 
     if (pp.include_guards.get(new_source.id)) |guard| {
         if (pp.defines.contains(guard)) return;
@@ -4087,6 +4118,7 @@ test "Include guards" {
 
                 .keyword_include,
                 .keyword_include_next,
+                .keyword_import,
                 .keyword_embed,
                 .keyword_define,
                 .keyword_defined,
@@ -4130,7 +4162,7 @@ test "Include guards" {
             defer buf.deinit(gpa);
 
             switch (tok_id) {
-                .keyword_include, .keyword_include_next => try buf.print(gpa, template, .{ tok_id.lexeme().?, " \"bar.h\"" }),
+                .keyword_include, .keyword_include_next, .keyword_import => try buf.print(gpa, template, .{ tok_id.lexeme().?, " \"bar.h\"" }),
                 .keyword_define, .keyword_undef => try buf.print(gpa, template, .{ tok_id.lexeme().?, " BAR" }),
                 .keyword_ifndef,
                 .keyword_ifdef,

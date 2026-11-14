@@ -11895,14 +11895,16 @@ fn fileWriteFilePositional(
                     @atomicStore(UseFcopyfile, &t.use_fcopyfile, .disabled, .monotonic);
                     return 0;
                 },
-                else => |e| {
+                .NOMEM => {
                     syscall.finish();
-                    assert(error.Unexpected == switch (e) {
-                        .NOMEM => return error.SystemResources,
-                        .INVAL => |err| errnoBug(err),
-                        else => |err| posix.unexpectedErrno(err),
-                    });
-                    return 0;
+                    return error.SystemResources;
+                },
+                else => {
+                    // fcopyfile does not support every kind of file descriptor;
+                    // for example it fails with EBADF when the destination is a
+                    // pipe. Fall back to the generic implementation for this call.
+                    syscall.finish();
+                    break :fcf;
                 },
             }
         }

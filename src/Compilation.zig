@@ -5121,7 +5121,11 @@ pub fn translateC(
     {
         const target = &owner_mod.resolved_target.result;
         const zig_lib = try arena.print("--zig-lib={f}", .{comp.dirs.zig_lib});
-        try argv.appendSlice(arena, &.{ "--zig-integration", zig_lib, "--", "-x", "c" });
+        const lang: []const u8 = switch (ext) {
+            .m, .hm => "objective-c",
+            else => "c",
+        };
+        try argv.appendSlice(arena, &.{ "--zig-integration", zig_lib, "--", "-x", lang });
 
         const resource_path = try comp.dirs.zig_lib.join(arena, &.{ "compiler", "aro", "include" });
         try argv.appendSlice(arena, &.{ "-isystem", resource_path });

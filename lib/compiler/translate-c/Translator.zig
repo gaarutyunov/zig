@@ -144,6 +144,12 @@ typedefs: std.StringArrayHashMapUnmanaged(void) = .empty,
 /// The lhs lval of a compound assignment expression.
 compound_assign_dummy: ?ZigNode = null,
 
+/// Zig names chosen for Objective-C classes and protocols.
+objc_names: std.AutoHashMapUnmanaged(QualType, []const u8) = .empty,
+/// Names of all enum constants; they become top level declarations and
+/// therefore must not be shadowed by generated Objective-C method parameters.
+objc_enum_constants: std.StringHashMapUnmanaged(void) = .empty,
+
 /// Set of variables whose initializers are currently being translated.
 /// Used to detect self-referential initializers.
 wip_var_inits: std.AutoHashMapUnmanaged(Node.Index, void) = .empty,
@@ -285,6 +291,8 @@ pub fn translate(options: Options) mem.Allocator.Error![]u8 {
         translator.typedefs.deinit(gpa);
         translator.global_scope.deinit();
         translator.wip_var_inits.deinit(gpa);
+        translator.objc_names.deinit(gpa);
+        translator.objc_enum_constants.deinit(gpa);
     }
 
     try translator.prepopulateGlobalNameTable();
@@ -390,6 +398,42 @@ fn prepopulateGlobalNameTable(t: *Translator) !void {
         if (macro.isBuiltin()) continue;
         if (!t.isSelfDefinedMacro(name, macro)) {
             try t.global_names.put(t.gpa, name, {});
+        }
+    }
+
+    if (t.tree.objc.containers.count() != 0) {
+        for (t.tree.root_decls.items) |decl| switch (decl.get(t.tree)) {
+            .enum_decl => |enum_decl| {
+                const enum_ty = enum_decl.container_qt.get(t.comp, .@"enum") orelse continue;
+                for (enum_ty.fields) |field| {
+                    try t.objc_enum_constants.put(t.gpa, field.name.lookup(t.comp), {});
+                }
+            },
+            else => {},
+        };
+    }
+
+    // Objective-C classes keep their name (which is also a typedef name).
+    // Protocols share a namespace with classes in Zig, so a protocol with the
+    // same name as a class (e.g. `NSObject`) gets a `Protocol` suffix.
+    for (t.tree.objc.containers.keys(), t.tree.objc.containers.values()) |qt, container| {
+        const name = container.name.lookup(t.comp);
+        switch (container.kind) {
+            .class => {
+                try t.objc_names.put(t.gpa, qt, name);
+                try t.global_names.put(t.gpa, name, {});
+            },
+            .protocol => {
+                var zig_name = name;
+                if (t.global_names.contains(zig_name) or t.tree.objc.classes.contains(container.name)) {
+                    zig_name = try t.arena.print("{s}Protocol", .{name});
+                    while (t.global_names.contains(zig_name)) {
+                        zig_name = try t.arena.print("{s}Protocol_{d}", .{ name, t.getMangle() });
+                    }
+                }
+                try t.objc_names.put(t.gpa, qt, zig_name);
+                try t.global_names.put(t.gpa, zig_name, {});
+            },
         }
     }
 }
@@ -502,6 +546,17 @@ fn transTypeDef(t: *Translator, scope: *Scope, typedef_node: Node.Index) Error!v
     if (t.typedef_decls.get(typedef_node)) |_|
         return; // Avoid processing this decl twice
 
+    // The implicit typedef of an Objective-C class name refers to the class itself.
+    if (t.tree.objc.get(typedef_decl.qt)) |_| {
+        if (t.objc_names.get(typedef_decl.qt.unqualified())) |class_name| {
+            if (mem.eql(u8, class_name, t.tree.tokSlice(typedef_decl.name_tok))) {
+                try t.typedef_decls.putNoClobber(t.gpa, typedef_node, class_name);
+                try t.typedefs.put(t.gpa, class_name, {});
+                return t.transObjCContainer(typedef_decl.qt);
+            }
+        }
+    }
+
     const toplevel = scope.id == .root;
     const bs: *Scope.Block = if (!toplevel) try scope.findBlockScope(t) else undefined;
 
@@ -564,6 +619,8 @@ fn transRecordDecl(t: *Translator, scope: *Scope, record_qt: QualType) Error!voi
 
     if (t.container_types.get(base.qt.unqualified())) |_|
         return; // Avoid processing this decl twice
+
+    if (t.tree.objc.get(base.qt) != null) return t.transObjCContainer(base.qt);
 
     const toplevel = scope.id == .root;
     const bs: *Scope.Block = if (!toplevel) try scope.findBlockScope(t) else undefined;
@@ -1280,6 +1337,16 @@ fn transType(t: *Translator, scope: *Scope, qt: QualType, source_loc: TokenIndex
                 }
             }
             return t.transType(scope, typeof_ty.base, source_loc);
+        },
+        .block => {
+            // Blocks are reference counted Objective-C objects; only expose them as opaque pointers.
+            const ptr = try ZigTag.single_pointer.create(t.arena, .{
+                .is_const = false,
+                .is_volatile = false,
+                .is_allowzero = false,
+                .elem_type = try ZigTag.type.create(t.arena, "anyopaque"),
+            });
+            return ZigTag.optional_type.create(t.arena, ptr);
         },
         .vector => |vector_ty| {
             const len = try t.createNumberNode(vector_ty.len);
@@ -4515,4 +4582,275 @@ pub fn getFnProto(t: *Translator, ref: ZigNode) ?*ast.Payload.Func {
         }
     }
     return null;
+}
+
+// ===========
+// Objective-C
+// ===========
+
+/// Translates an Objective-C class or protocol to an opaque type whose
+/// methods send the corresponding messages using `objc_msgSend`.
+fn transObjCContainer(t: *Translator, qt: QualType) Error!void {
+    const key = qt.unqualified();
+    if (t.container_types.get(key)) |_| return;
+    const container = t.tree.objc.get(key).?;
+    const name = t.objc_names.get(key).?;
+    // Register the name before translating the members since they may refer
+    // back to this type.
+    try t.container_types.putNoClobber(t.gpa, key, name);
+
+    var member_names: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer member_names.deinit(t.gpa);
+
+    // Collect own methods (including those from categories) and methods
+    // returning `instancetype` inherited from superclasses, which are
+    // retargeted to this class (e.g. `+alloc`, `+new`, `-init`).
+    const Entry = struct { method: *const aro.Tree.ObjC.Method, inherited: bool, name: []const u8 = undefined };
+    var entries: std.ArrayList(Entry) = .empty;
+    defer entries.deinit(t.gpa);
+    {
+        // Selectors already collected, per method kind, to skip overridden methods.
+        var seen: [2]std.StringHashMapUnmanaged(void) = .{ .empty, .empty };
+        defer for (&seen) |*set| set.deinit(t.gpa);
+        // Instance methods first so that they get the plain names; class
+        // methods are only renamed on conflict.
+        for ([_]@FieldType(aro.Tree.ObjC.Method, "kind"){ .instance, .class }) |kind| {
+            var cur: ?*const aro.Tree.ObjC.Container = container;
+            var inherited = false;
+            while (cur) |c| : ({
+                cur = if (c.superclass) |super_qt| t.tree.objc.get(super_qt) else null;
+                inherited = true;
+            }) {
+                for (c.methods.items) |*method| {
+                    if (method.kind != kind) continue;
+                    if (method.variadic) continue;
+                    if (inherited and !method.returns_instancetype) continue;
+                    // Class methods of protocols have no known receiver.
+                    if (kind == .class and container.kind == .protocol) continue;
+                    const gop = try seen[@backingInt(kind)].getOrPut(t.gpa, method.selector);
+                    if (gop.found_existing) continue;
+                    try entries.append(t.gpa, .{ .method = method, .inherited = inherited });
+                }
+            }
+        }
+    }
+    // Name all members up front so that parameter names can avoid all of them.
+    for (entries.items) |*entry| entry.name = try t.objcMethodName(entry.method, &member_names);
+    const has_cast_fn = !member_names.contains("as");
+    if (has_cast_fn) try member_names.put(t.gpa, "as", {});
+
+    var decls: std.ArrayList(ZigNode) = .empty;
+    defer decls.deinit(t.gpa);
+    for (entries.items) |entry| {
+        const decl = t.transObjCMethod(name, container, entry.method, entry.inherited, entry.name, &member_names) catch |err| switch (err) {
+            error.UnsupportedType => continue,
+            error.OutOfMemory => |e| return e,
+        };
+        try decls.append(t.gpa, decl);
+    }
+    // `obj.as(T)`: unchecked cast to a superclass or protocol type, to access
+    // inherited methods.
+    if (has_cast_fn) try decls.append(t.gpa, try t.objcCastFn(name, &member_names));
+
+    const init_node = try ZigTag.@"opaque".create(t.arena, .{
+        .layout = .none,
+        .fields = &.{},
+        .decls = try t.arena.dupe(ZigNode, decls.items),
+    });
+    const payload = try t.arena.create(ast.Payload.SimpleVarDecl);
+    payload.* = .{
+        .base = .{ .tag = .pub_var_simple },
+        .data = .{
+            .name = name,
+            .init = init_node,
+        },
+    };
+    try t.addTopLevelDecl(name, ZigNode.initPayload(&payload.base));
+}
+
+/// Zig identifier for a selector: `initWithFrame:device:` -> `initWithFrame_device`.
+fn objcMethodName(t: *Translator, method: *const aro.Tree.ObjC.Method, member_names: *std.StringArrayHashMapUnmanaged(void)) Error![]const u8 {
+    const full = try t.arena.dupe(u8, method.selector);
+    mem.replaceScalar(u8, full, ':', '_');
+    const trimmed = mem.trimEnd(u8, full, "_");
+    var candidates: [3][]const u8 = .{ trimmed, full, undefined };
+    candidates[2] = try t.arena.print("{s}{s}", .{ if (method.kind == .class) "class_" else "instance_", full });
+    for (candidates) |candidate| {
+        if (candidate.len == 0) continue;
+        if (member_names.contains(candidate)) continue;
+        // A method with the same name as a global declaration would make
+        // references to that declaration from within the container ambiguous.
+        if (t.global_names.contains(candidate)) continue;
+        try member_names.put(t.gpa, candidate, {});
+        return candidate;
+    }
+    while (true) {
+        const candidate = try t.arena.print("{s}_{d}", .{ trimmed, t.getMangle() });
+        if (member_names.contains(candidate) or t.global_names.contains(candidate)) continue;
+        try member_names.put(t.gpa, candidate, {});
+        return candidate;
+    }
+}
+
+/// Picks a parameter name that does not shadow any declaration visible from
+/// inside the generated container.
+fn objcLocalName(
+    t: *Translator,
+    member_names: *const std.StringArrayHashMapUnmanaged(void),
+    want: []const u8,
+    used: *const std.StringArrayHashMapUnmanaged(void),
+) Error![]const u8 {
+    var name = want;
+    while (true) {
+        const conflicts = used.contains(name) or
+            member_names.contains(name) or
+            t.global_names.contains(name) or
+            t.objc_enum_constants.contains(name) or
+            t.global_scope.contains(name) or
+            mem.startsWith(u8, name, "__");
+        if (!conflicts) return name;
+        name = try t.arena.print("{s}_", .{name});
+    }
+}
+
+fn transObjCMethod(
+    t: *Translator,
+    container_name: []const u8,
+    container: *const aro.Tree.ObjC.Container,
+    method: *const aro.Tree.ObjC.Method,
+    /// Inherited `instancetype` method; returns an instance of this container.
+    inherited: bool,
+    name: []const u8,
+    member_names: *const std.StringArrayHashMapUnmanaged(void),
+) TypeError!ZigNode {
+    const scope = &t.global_scope.base;
+    const loc = method.tok;
+
+    var used_names: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer used_names.deinit(t.gpa);
+
+    const return_type = if (inherited)
+        try t.objcSelfPointerType(container_name, true)
+    else
+        try t.objcReturnType(method.return_qt, loc);
+
+    var params: std.ArrayList(ast.Payload.Param) = .empty;
+    defer params.deinit(t.gpa);
+    var args: std.ArrayList(ZigNode) = .empty;
+    defer args.deinit(t.gpa);
+
+    const receiver: ZigNode = switch (method.kind) {
+        .instance => receiver: {
+            const self_name = try t.objcLocalName(member_names, "self", &used_names);
+            try used_names.put(t.gpa, self_name, {});
+            try params.append(t.gpa, .{
+                .is_noalias = false,
+                .name = self_name,
+                .type = try t.objcSelfPointerType(container_name, false),
+            });
+            break :receiver try ZigTag.identifier.create(t.arena, self_name);
+        },
+        .class => try t.createHelperCallNode(.objcClass, &.{
+            try ZigTag.string_literal.create(t.arena, try t.arena.print("\"{f}\"", .{std.zig.fmtString(container.name.lookup(t.comp))})),
+        }),
+    };
+
+    for (method.params) |param| {
+        const param_name = try t.objcLocalName(member_names, param.name, &used_names);
+        try used_names.put(t.gpa, param_name, {});
+        try params.append(t.gpa, .{
+            .is_noalias = false,
+            .name = param_name,
+            .type = try t.transType(scope, param.qt, loc),
+        });
+        try args.append(t.gpa, try ZigTag.identifier.create(t.arena, param_name));
+    }
+
+    const call = try t.createHelperCallNode(.objcMsgSend, &.{
+        if (inherited) try t.objcSelfPointerType(container_name, true) else try t.objcReturnType(method.return_qt, loc),
+        receiver,
+        try ZigTag.string_literal.create(t.arena, try t.arena.print("\"{f}\"", .{std.zig.fmtString(method.selector)})),
+        try ZigTag.tuple.create(t.arena, try t.arena.dupe(ZigNode, args.items)),
+    });
+    const body = try ZigTag.block.create(t.arena, .{
+        .label = null,
+        .stmts = try t.arena.dupe(ZigNode, &.{try ZigTag.@"return".create(t.arena, call)}),
+    });
+
+    return ZigTag.func.create(t.arena, .{
+        .is_pub = true,
+        .is_extern = false,
+        .is_export = false,
+        .is_inline = false,
+        .is_var_args = false,
+        .name = name,
+        .linksection_string = null,
+        .explicit_callconv = null,
+        .params = try t.arena.dupe(ast.Payload.Param, params.items),
+        .return_type = return_type,
+        .body = body,
+        .alignment = null,
+    });
+}
+
+fn objcReturnType(t: *Translator, qt: QualType, loc: TokenIndex) TypeError!ZigNode {
+    if (qt.is(t.comp, .void)) return ZigTag.void_type.init();
+    return t.transType(&t.global_scope.base, qt, loc);
+}
+
+/// `*Name` or `?*Name`.
+fn objcSelfPointerType(t: *Translator, container_name: []const u8, optional: bool) Error!ZigNode {
+    const ptr = try ZigTag.single_pointer.create(t.arena, .{
+        .is_const = false,
+        .is_volatile = false,
+        .is_allowzero = false,
+        .elem_type = try ZigTag.identifier.create(t.arena, container_name),
+    });
+    return if (optional) ZigTag.optional_type.create(t.arena, ptr) else ptr;
+}
+
+/// pub fn as(self: *Name, comptime T: type) *T {
+///     return @ptrCast(self);
+/// }
+fn objcCastFn(
+    t: *Translator,
+    container_name: []const u8,
+    member_names: *const std.StringArrayHashMapUnmanaged(void),
+) Error!ZigNode {
+    var used_names: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer used_names.deinit(t.gpa);
+    const self_name = try t.objcLocalName(member_names, "self", &used_names);
+    try used_names.put(t.gpa, self_name, {});
+    const type_name = try t.objcLocalName(member_names, "T", &used_names);
+    const self_ident = try ZigTag.identifier.create(t.arena, self_name);
+    const t_ident = try ZigTag.identifier.create(t.arena, type_name);
+    const target_ptr = try ZigTag.single_pointer.create(t.arena, .{
+        .is_const = false,
+        .is_volatile = false,
+        .is_allowzero = false,
+        .elem_type = t_ident,
+    });
+    const body = try ZigTag.block.create(t.arena, .{
+        .label = null,
+        .stmts = try t.arena.dupe(ZigNode, &.{
+            try ZigTag.@"return".create(t.arena, try ZigTag.ptr_cast.create(t.arena, self_ident)),
+        }),
+    });
+    return ZigTag.func.create(t.arena, .{
+        .is_pub = true,
+        .is_extern = false,
+        .is_export = false,
+        .is_inline = true,
+        .is_var_args = false,
+        .name = "as",
+        .linksection_string = null,
+        .explicit_callconv = null,
+        .params = try t.arena.dupe(ast.Payload.Param, &.{
+            .{ .is_noalias = false, .name = self_name, .type = try t.objcSelfPointerType(container_name, false) },
+            .{ .is_noalias = false, .is_comptime = true, .name = type_name, .type = try ZigTag.type.create(t.arena, "type") },
+        }),
+        .return_type = target_ptr,
+        .body = body,
+        .alignment = null,
+    });
 }

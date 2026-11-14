@@ -2376,3 +2376,28 @@ pub const typename_invalid_specifier: Diagnostic = .{
     .fmt = "type name does not allow {s} specifier to be specified",
     .kind = .@"error",
 };
+
+pub const objc_expected_directive: Diagnostic = .{
+    .fmt = "expected an Objective-C directive after '@'",
+    .kind = .@"error",
+};
+
+pub const objc_unknown_directive: Diagnostic = .{
+    .fmt = "unknown Objective-C directive '@{s}'",
+    .kind = .@"error",
+};
+
+pub const objc_unsupported_directive: Diagnostic = .{
+    .fmt = "Objective-C '@{s}' is not supported",
+    .kind = .@"error",
+};
+
+pub const objc_expected_selector: Diagnostic = .{
+    .fmt = "expected selector for Objective-C method",
+    .kind = .@"error",
+};
+
+pub const objc_missing_end: Diagnostic = .{
+    .fmt = "missing '@end'",
+    .kind = .@"error",
+};

@@ -924,7 +924,7 @@ fn updateNavCode(
         .none => switch (mod.optimize_mode) {
             .debug, .safe, .fast => target_util.defaultFunctionAlignment(target),
             .small => target_util.minFunctionAlignment(target),
-        },
+        }.maxStrict(Type.fromInterned(nav.resolved.?.type).abiAlignment(zcu)),
         else => |a| a.maxStrict(target_util.minFunctionAlignment(target)),
     };
 

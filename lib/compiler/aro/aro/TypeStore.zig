@@ -595,7 +595,10 @@ pub const QualType = bitpack struct(u32) {
             .atomic => |atomic| atomic.sizeofOrNull(comp),
             .vector => |vector| {
                 const elem_size = vector.elem.sizeofOrNull(comp) orelse return null;
-                return elem_size * vector.len;
+                // Vectors with a non power of two size (e.g. `ext_vector_type(3)`)
+                // are padded to the next power of two, like Clang does.
+                const size = elem_size * vector.len;
+                return if (size == 0) 0 else std.math.ceilPowerOfTwoAssert(u64, size);
             },
             .array => |array| {
                 const len = switch (array.len) {
@@ -776,7 +779,13 @@ pub const QualType = bitpack struct(u32) {
             .func => comp.target.defaultFunctionAlignment(),
 
             .array => |array| return array.elem.alignof(comp),
-            .vector => |vector| continue :loop vector.elem.base(comp).type,
+            .vector => |vector| {
+                // Like Clang, vectors are aligned to their (power of two) size.
+                const elem_size = vector.elem.sizeofOrNull(comp) orelse return 1;
+                const size = elem_size * vector.len;
+                if (size == 0) return 1;
+                return @intCast(std.math.ceilPowerOfTwoAssert(u64, size));
+            },
 
             .@"struct", .@"union" => |record| {
                 const layout = record.layout orelse return 0;

@@ -182,6 +182,10 @@ default_symbol_visibility: Attribute.Args.Visibility = .default,
 
 blocks: bool = false,
 
+/// Objective-C mode. Enables `@`-directives, `#import` without extension
+/// diagnostics and Objective-C specific predefined macros.
+objc: bool = false,
+
 /// If non-null, contains ARM LDREX/STREX mask. Only populated on ARM targets.
 arm_ldrex: ?ArmLdrex = null,
 /// Whether the target supports AVR's non-standard 24-bit integer types.
@@ -191,6 +195,12 @@ pthread: bool = false,
 
 pub fn setStandard(self: *LangOpts, name: []const u8) error{InvalidStandard}!void {
     self.standard = Standard.NameMap.get(name) orelse return error.InvalidStandard;
+}
+
+pub fn setObjC(self: *LangOpts, enabled: bool) void {
+    self.objc = enabled;
+    // Clang enables blocks by default for Objective-C on all Apple targets.
+    if (enabled) self.blocks = true;
 }
 
 pub fn setMSExtensions(self: *LangOpts, enabled: bool) void {

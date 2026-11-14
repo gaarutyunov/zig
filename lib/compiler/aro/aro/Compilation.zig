@@ -1435,6 +1435,35 @@ fn generateSystemDefines(comp: *Compilation, w: *Io.Writer) !void {
     if (comp.langopts.blocks) {
         try define(w, "__BLOCKS__");
     }
+
+    // Objective-C
+    if (comp.langopts.objc) {
+        try define(w, "__OBJC__");
+        // Only the modern (non-fragile) runtime is supported.
+        try define(w, "__OBJC2__");
+        try define(w, "__NEXT_RUNTIME__");
+        try define(w, "OBJC_NEW_PROPERTIES");
+        try w.print("#define __OBJC_BOOL_IS_BOOL {d}\n", .{
+            @intFromBool(!(target.cpu.arch == .x86_64 and target.os.tag.isDarwin())),
+        });
+        // Interface Builder annotations.
+        try w.writeAll(
+            \\#define IBOutlet
+            \\#define IBOutletCollection(ClassName)
+            \\#define IBAction void
+            \\#define IBInspectable
+            \\#define IB_DESIGNABLE
+            \\
+        );
+        // Ownership qualifiers are no-ops without ARC.
+        try w.writeAll(
+            \\#define __strong
+            \\#define __weak
+            \\#define __unsafe_unretained
+            \\#define __autoreleasing
+            \\
+        );
+    }
 }
 
 const RiscvFloatAbi = enum { soft, single, double };

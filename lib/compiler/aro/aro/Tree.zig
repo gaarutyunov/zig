@@ -10,6 +10,7 @@ const Source = @import("Source.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const QualType = @import("TypeStore.zig").QualType;
 const Value = @import("Value.zig");
+const StringId = @import("StringInterner.zig").StringId;
 
 pub const Token = struct {
     id: Id,
@@ -204,10 +205,82 @@ value_map: ValueMap = .empty,
 
 attr_map: Attribute.Map = .{},
 
+/// Objective-C classes and protocols declared in this translation unit.
+objc: ObjC = .{},
+
 pub const genIr = CodeGen.genIr;
+
+/// Side table describing Objective-C declarations.
+///
+/// Objective-C classes and protocols are represented in the type system as
+/// opaque (incomplete) struct types which are only reachable through their
+/// name; this table attaches the Objective-C specific information to them.
+pub const ObjC = struct {
+    /// All Objective-C containers keyed by their unqualified record type,
+    /// in declaration order.
+    containers: std.AutoArrayHashMapUnmanaged(QualType, Container) = .empty,
+    /// Class name to record type.
+    classes: std.AutoHashMapUnmanaged(StringId, QualType) = .empty,
+    /// Protocol name to record type.
+    protocols: std.AutoHashMapUnmanaged(StringId, QualType) = .empty,
+    /// Backing memory for `Container.methods`, `Container.protocols` and
+    /// `Method.params` and selector strings.
+    arena: std.heap.ArenaAllocator.State = .{},
+
+    pub const Container = struct {
+        kind: Kind,
+        name: StringId,
+        /// Token of the name of the first declaration.
+        name_tok: TokenIndex,
+        /// Superclass of a class, if any.
+        superclass: ?QualType = null,
+        /// Protocols this class or protocol conforms to.
+        protocols: std.ArrayList(QualType) = .empty,
+        methods: std.ArrayList(Method) = .empty,
+        /// True once a full `@interface` / `@protocol` definition was seen.
+        defined: bool = false,
+
+        pub const Kind = enum { class, protocol };
+    };
+
+    pub const Method = struct {
+        /// Full selector, e.g. `initWithFrame:device:`.
+        selector: []const u8,
+        kind: enum { instance, class },
+        return_qt: QualType,
+        params: []const Param,
+        variadic: bool,
+        /// Declared in an `@optional` section of a protocol.
+        optional: bool,
+        /// Generated from a `@property` declaration.
+        property: bool,
+        /// The declared return type is `instancetype`, so the method returns
+        /// an instance of the receiving class (also for subclasses).
+        returns_instancetype: bool = false,
+        tok: TokenIndex,
+    };
+
+    pub const Param = struct {
+        name: []const u8,
+        qt: QualType,
+    };
+
+    pub fn deinit(objc: *ObjC, gpa: std.mem.Allocator) void {
+        objc.containers.deinit(gpa);
+        objc.classes.deinit(gpa);
+        objc.protocols.deinit(gpa);
+        objc.arena.promote(gpa).deinit();
+        objc.* = undefined;
+    }
+
+    pub fn get(objc: *const ObjC, qt: QualType) ?*Container {
+        return objc.containers.getPtr(qt.unqualified());
+    }
+};
 
 pub fn deinit(tree: *Tree) void {
     const gpa = tree.comp.gpa;
+    tree.objc.deinit(gpa);
     tree.nodes.deinit(gpa);
     tree.extra.deinit(gpa);
     tree.root_decls.deinit(gpa);

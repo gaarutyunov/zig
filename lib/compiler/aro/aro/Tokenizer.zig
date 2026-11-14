@@ -131,6 +131,8 @@ pub const Token = struct {
         ampersand_ampersand,
         ampersand_equal,
         question_mark,
+        /// Objective-C `@`, only produced in Objective-C mode.
+        at_sign,
         angle_bracket_left,
         angle_bracket_left_equal,
         angle_bracket_angle_bracket_left,
@@ -247,6 +249,7 @@ pub const Token = struct {
         // Preprocessor directives
         keyword_include,
         keyword_include_next,
+        keyword_import,
         keyword_embed,
         keyword_define,
         keyword_defined,
@@ -371,6 +374,7 @@ pub const Token = struct {
             switch (id) {
                 .keyword_include,
                 .keyword_include_next,
+                .keyword_import,
                 .keyword_embed,
                 .keyword_define,
                 .keyword_defined,
@@ -534,6 +538,7 @@ pub const Token = struct {
             switch (id.*) {
                 .keyword_include,
                 .keyword_include_next,
+                .keyword_import,
                 .keyword_embed,
                 .keyword_define,
                 .keyword_undef,
@@ -648,6 +653,7 @@ pub const Token = struct {
                 .ampersand_ampersand => "&&",
                 .ampersand_equal => "&=",
                 .question_mark => "?",
+                .at_sign => "@",
                 .angle_bracket_left => "<",
                 .angle_bracket_left_equal => "<=",
                 .angle_bracket_angle_bracket_left => "<<",
@@ -733,6 +739,7 @@ pub const Token = struct {
                 .keyword_dfloat64x => "_Decimal64x",
                 .keyword_include => "include",
                 .keyword_include_next => "include_next",
+                .keyword_import => "import",
                 .keyword_embed => "embed",
                 .keyword_define => "define",
                 .keyword_defined => "defined",
@@ -1058,6 +1065,7 @@ pub const Token = struct {
         // Preprocessor directives
         .{ "include", .keyword_include },
         .{ "include_next", .keyword_include_next },
+        .{ "import", .keyword_import },
         .{ "embed", .keyword_embed },
         .{ "define", .keyword_define },
         .{ "defined", .keyword_defined },
@@ -1318,6 +1326,10 @@ pub fn next(self: *Tokenizer) Token {
                 self.index += 1;
             },
             0x80...0xFF => continue :loop .extended_identifier,
+            '@' => {
+                id = if (self.langopts.objc) .at_sign else .invalid;
+                self.index += 1;
+            },
             else => {
                 id = .invalid;
                 self.index += 1;
@@ -2156,6 +2168,7 @@ test "preprocessor keywords" {
     try expectTokens(
         \\#include
         \\#include_next
+        \\#import
         \\#embed
         \\#define
         \\#ifdef
@@ -2169,6 +2182,9 @@ test "preprocessor keywords" {
         .nl,
         .hash,
         .keyword_include_next,
+        .nl,
+        .hash,
+        .keyword_import,
         .nl,
         .hash,
         .keyword_embed,

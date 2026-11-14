@@ -225,6 +225,7 @@ pub const usage =
     \\                          Use `# <num>` linemarkers in preprocessed output
     \\  -fvisibility=[default|hidden|internal|protected]
     \\                          Set the default ELF image symbol visibility to the specified option—all symbols are marked with this unless overridden within the code
+    \\  -ObjC                   Treat source input files as Objective-C inputs
     \\  -fblocks                Enable support for clang's Blocks language extension
     \\  -fno-blocks             Disable support for clang's Blocks language extension
     \\  -iquote <dir>           Add directory to QUOTE include search path
@@ -839,9 +840,15 @@ pub fn parseArgs(
                     }
                     lang = args[i];
                 }
-                if (!mem.eql(u8, lang, "none") and !mem.eql(u8, lang, "c")) {
+                if (mem.eql(u8, lang, "objective-c") or mem.eql(u8, lang, "objective-c-header")) {
+                    d.comp.langopts.setObjC(true);
+                } else if (mem.eql(u8, lang, "c") or mem.eql(u8, lang, "c-header")) {
+                    d.comp.langopts.setObjC(false);
+                } else if (!mem.eql(u8, lang, "none")) {
                     try d.err("language not recognized: '{s}'", .{lang});
                 }
+            } else if (mem.eql(u8, arg, "-ObjC")) {
+                d.comp.langopts.setObjC(true);
             } else if (mem.startsWith(u8, arg, "-flto")) {
                 const rest = arg["-flto".len..];
                 if (rest.len == 0 or
@@ -870,6 +877,7 @@ pub fn parseArgs(
         } else if (mem.endsWith(u8, arg, ".o") or mem.endsWith(u8, arg, ".obj")) {
             try d.link_objects.append(gpa, arg);
         } else {
+            if (mem.endsWith(u8, arg, ".m")) d.comp.langopts.setObjC(true);
             const source = d.addSource(arg) catch |er| {
                 return d.fatal("unable to add source file '{s}': {s}", .{ arg, errorDescription(er) });
             };

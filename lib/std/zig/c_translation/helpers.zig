@@ -408,3 +408,101 @@ pub inline fn ULL_SUFFIX(comptime n: comptime_int) @TypeOf(promoteIntLiteral(c_u
 pub fn WL_CONTAINER_OF(ptr: anytype, sample: anytype, comptime member: []const u8) @TypeOf(sample) {
     return @fieldParentPtr(member, ptr);
 }
+
+/// Objective-C runtime support used by translated Objective-C classes and protocols.
+pub const objc = struct {
+    /// An opaque Objective-C selector (`SEL`).
+    pub const Sel = *opaque {};
+    /// An opaque Objective-C class object (`Class`).
+    pub const Class = *opaque {};
+
+    pub extern "objc" fn sel_registerName(name: [*:0]const u8) Sel;
+    pub extern "objc" fn objc_getClass(name: [*:0]const u8) ?Class;
+    pub extern "objc" fn objc_msgSend() void;
+    pub extern "objc" fn objc_msgSend_stret() void;
+    pub extern "objc" fn objc_msgSend_fpret() void;
+
+    /// Returns the selector registered for `name`, caching the lookup.
+    pub fn selector(comptime name: [:0]const u8) Sel {
+        // The struct must capture `name` so that each selector gets its own cache.
+        const Cache = struct {
+            const key = name;
+            var sel: ?Sel = null;
+        };
+        if (@atomicLoad(?Sel, &Cache.sel, .unordered)) |sel| return sel;
+        const sel = sel_registerName(name);
+        @atomicStore(?Sel, &Cache.sel, sel, .unordered);
+        return sel;
+    }
+
+    /// Returns the class object named `name`, caching the lookup.
+    pub fn class(comptime name: [:0]const u8) Class {
+        // The struct must capture `name` so that each class gets its own cache.
+        const Cache = struct {
+            const key = name;
+            var class: ?Class = null;
+        };
+        if (@atomicLoad(?Class, &Cache.class, .unordered)) |cls| return cls;
+        const cls = objc_getClass(name) orelse
+            std.debug.panic("Objective-C class '{s}' not found", .{name});
+        @atomicStore(?Class, &Cache.class, cls, .unordered);
+        return cls;
+    }
+
+    /// Which variant of `objc_msgSend` must be used for a method returning `R`.
+    fn MsgSendVariant(comptime R: type) enum { normal, stret, fpret } {
+        const arch = @import("builtin").cpu.arch;
+        switch (arch) {
+            .x86_64 => {
+                if (R == c_longdouble) return .fpret;
+                switch (@typeInfo(R)) {
+                    // Aggregates larger than two eightbytes are returned in memory.
+                    .@"struct", .@"union", .array => if (@sizeOf(R) > 16) return .stret,
+                    else => {},
+                }
+            },
+            .x86 => {
+                if (R == f32 or R == f64 or R == c_longdouble) return .fpret;
+                switch (@typeInfo(R)) {
+                    .@"struct", .@"union", .array => if (@sizeOf(R) > 8) return .stret,
+                    else => {},
+                }
+            },
+            .arm, .thumb => switch (@typeInfo(R)) {
+                .@"struct", .@"union", .array => if (@sizeOf(R) > 4) return .stret,
+                else => {},
+            },
+            else => {},
+        }
+        return .normal;
+    }
+
+    fn MsgSendFn(comptime R: type, comptime Receiver: type, comptime Args: type) type {
+        const arg_types = @typeInfo(Args).@"struct".field_types;
+        var param_types: [arg_types.len + 2]type = undefined;
+        param_types[0] = Receiver;
+        param_types[1] = Sel;
+        for (arg_types, 0..) |arg_type, i| param_types[i + 2] = arg_type;
+        const param_attrs: [param_types.len]std.lang.Type.Fn.ParamAttributes = @splat(.{});
+        const final_param_types = param_types;
+        return @Fn(&final_param_types, &param_attrs, R, .{ .@"callconv" = .c });
+    }
+};
+
+/// Sends the Objective-C message `selector` with `args` to `receiver`,
+/// returning a value of type `R`. Used by translated Objective-C methods.
+pub inline fn objcMsgSend(comptime R: type, receiver: anytype, comptime selector: [:0]const u8, args: anytype) R {
+    const Fn = objc.MsgSendFn(R, @TypeOf(receiver), @TypeOf(args));
+    const impl: *const Fn = switch (comptime objc.MsgSendVariant(R)) {
+        .normal => @ptrCast(&objc.objc_msgSend),
+        .stret => @ptrCast(&objc.objc_msgSend_stret),
+        .fpret => @ptrCast(&objc.objc_msgSend_fpret),
+    };
+    return @call(.auto, impl, .{ receiver, objc.selector(selector) } ++ args);
+}
+
+/// Returns the Objective-C class object named `name`.
+/// Used as the receiver of translated Objective-C class methods.
+pub inline fn objcClass(comptime name: [:0]const u8) objc.Class {
+    return objc.class(name);
+}

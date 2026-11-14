@@ -645,6 +645,7 @@ pub const Payload = struct {
 
     pub const Param = struct {
         is_noalias: bool,
+        is_comptime: bool = false,
         name: ?[]const u8,
         type: Node,
     };
@@ -3100,6 +3101,7 @@ fn renderParams(c: *Context, params: []Payload.Param, is_var_args: bool) !std.Ar
     for (params, 0..) |param, i| {
         if (i != 0) _ = try c.addToken(.comma, ",");
         if (param.is_noalias) _ = try c.addToken(.keyword_noalias, "noalias");
+        if (param.is_comptime) _ = try c.addToken(.keyword_comptime, "comptime");
         if (param.name) |some| {
             _ = try c.addIdentifier(some);
             _ = try c.addToken(.colon, ":");

@@ -476,6 +476,8 @@ pub fn applyDeclAttrsExtra(
                 .fallthrough => try wip.err(.stmt_attr_on_decl, .{attr}),
             },
             .clang => |clang_attr| switch (clang_attr) {
+                // Handled by the parser: only the first overload is kept.
+                .overloadable => {},
                 .unavailable => {
                     if (try wip.argCountMinMax(0, 1)) continue;
 
@@ -1036,9 +1038,12 @@ pub fn applyTypeAttrs(wip: *Wip, p: *Parser, qt: QualType) !QualType {
                 .riscv_vls_cc,
                 .vectorcall,
                 => try wip.applyCallingConvention(),
+                .ext_vector_type => {
+                    try wip.applyExtVectorType();
+                    attr.used_as_type_attr = true;
+                },
                 .address_space,
                 .arm_sve_vector_bits,
-                .ext_vector_type,
                 .matrix_type,
                 .noderef,
                 => {
@@ -1127,6 +1132,31 @@ fn applyVectorSize(wip: *Wip) !void {
     wip.current.qt = try comp.type_store.put(comp.gpa, .{ .vector = .{
         .elem = qt,
         .len = @intCast(vec_bytes / elem_size),
+    } });
+}
+
+/// `__attribute__((ext_vector_type(N)))`: a vector of `N` elements.
+fn applyExtVectorType(wip: *Wip) !void {
+    const qt = wip.current.qt;
+    if (qt.isInvalid()) return;
+    if (try wip.argCount(1)) return;
+
+    const comp = wip.current.parser.comp;
+    const scalar_kind = qt.scalarKind(comp);
+    if (scalar_kind != .int and scalar_kind != .float and scalar_kind != .bool) {
+        try wip.err(.invalid_vec_elem_ty, .{qt});
+        return error.ParsingFailed;
+    }
+
+    const len = (try wip.arg(u32)) orelse return;
+    if (len == 0) {
+        try wip.err(.invalid_vec_elem_ty, .{qt});
+        return error.ParsingFailed;
+    }
+
+    wip.current.qt = try comp.type_store.put(comp.gpa, .{ .vector = .{
+        .elem = qt,
+        .len = len,
     } });
 }
 

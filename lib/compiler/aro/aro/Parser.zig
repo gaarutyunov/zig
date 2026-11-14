@@ -162,6 +162,15 @@ auto_type_decl_name: StringId = .empty,
 
 init_context: InitContext = .runtime,
 
+/// Objective-C class or protocol whose members are currently being parsed.
+objc_container: ?QualType = null,
+/// Generic type parameters of the Objective-C class currently being parsed.
+objc_type_params: std.ArrayList(StringId) = .empty,
+/// Set when a `>>` token closed both a type parameter bound and the type parameter list.
+objc_type_params_closed: bool = false,
+/// Set when `instancetype` was used as a type.
+objc_saw_instancetype: bool = false,
+
 /// Various variables that are different for each function.
 func: struct {
     /// null if not in function, will always be plain func
@@ -1123,6 +1132,7 @@ pub fn parse(pp: *Preprocessor) Compilation.Error!Tree {
         p.wip_attrs.deinit(gpa);
         p.tentative_defs.deinit(gpa);
         p.maybe_unused_decl.deinit(gpa);
+        p.objc_type_params.deinit(gpa);
     }
 
     try p.syms.pushScope(&p);
@@ -1173,6 +1183,7 @@ pub fn parse(pp: *Preprocessor) Compilation.Error!Tree {
             else => |e| return e,
         };
 
+        if (try p.parseOrNextDecl(objcDecl)) continue;
         if (try p.parseOrNextDecl(staticAssert)) continue;
         if (try p.parseOrNextDecl(decl)) continue;
         if (p.eatToken(.keyword_extension)) |_| {
@@ -1451,6 +1462,16 @@ fn decl(p: *Parser) Error!bool {
         return true;
     };
 
+    // Clang's `overloadable` functions can not be represented; only the first
+    // overload of a name is kept (as a declaration), the rest are ignored.
+    if (init_d.d.declarator_type == .func and p.hasOverloadableAttr()) {
+        const name = try p.comp.internString(p.tokSlice(init_d.d.name));
+        if (p.syms.findSymbol(name) != null) {
+            if (p.tok_ids[p.tok_i] == .l_brace) p.objcSkipBraces() else p.skipTo(.semicolon);
+            return true;
+        }
+    }
+
     // Check for function definition.
     if (init_d.d.declarator_type == .func and init_d.initializer == null) fn_def: {
         switch (p.tok_ids[p.tok_i]) {
@@ -1631,6 +1652,16 @@ fn decl(p: *Parser) Error!bool {
         try decl_spec.validateFnDef(p);
         try p.tree.setNode(.{ .function = function }, @backingInt(decl_node));
         try p.wip_attrs.applyDeclAttrs(p, decl_node, previous_decl);
+
+        if (p.tok_ids[p.tok_i] == .l_brace and
+            (p.hasOverloadableAttr() or (p.comp.langopts.objc and p.objcBodyHasObjCSyntax())))
+        {
+            // Objective-C expressions (message sends, literals, ...) are not
+            // supported; keep only the declaration of the function.
+            p.objcSkipBraces();
+            try p.decl_buf.append(gpa, decl_node);
+            return true;
+        }
 
         p.local_unused_err_count = p.diagnostics.errors;
         function.body = (try p.compoundStmt(true, null)) orelse {
@@ -2199,6 +2230,10 @@ fn attribute(p: *Parser, syntax: Attribute.Syntax) Error!void {
     if (namespaced == .clang and namespaced.clang == .availability) {
         return p.parseAvailabilityArgs();
     }
+    if (namespaced.isIgnoredInteropAttribute()) {
+        if (p.eatToken(.l_paren)) |_| p.skipTo(.r_paren);
+        return;
+    }
 
     const list_buf_top = p.list_buf.items.len;
     defer p.list_buf.items.len = list_buf_top;
@@ -2708,9 +2743,27 @@ fn typeSpec(p: *Parser, builder: *TypeStore.Builder) Error!bool {
                 if (declspec_found) {
                     interned_name = try p.comp.internString(p.tokSlice(p.tok_i));
                 }
+                if (p.comp.langopts.objc and builder.type == .none) {
+                    if (mem.eql(u8, p.tokSlice(p.tok_i), "__kindof")) {
+                        p.tok_i += 1;
+                        continue;
+                    }
+                    if (try p.objcSpecialType(interned_name)) |special_qt| {
+                        _ = builder.combineTypedef(special_qt);
+                        p.tok_i += 1;
+                        // e.g. `KeyType <NSCopying>`
+                        if (p.tok_ids[p.tok_i] == .angle_bracket_left) p.objcSkipAngles();
+                        continue;
+                    }
+                }
                 const typedef = (try p.syms.findTypedef(p, interned_name, p.tok_i, builder.type != .none)) orelse break;
                 p.markUsed(typedef.node);
                 if (!builder.combineTypedef(typedef.qt)) break;
+                if (p.comp.langopts.objc and p.tok_ids[p.tok_i + 1] == .angle_bracket_left) {
+                    p.tok_i += 1;
+                    try p.objcTypeArgs(builder, interned_name);
+                    continue;
+                }
             },
             .keyword_bit_int => {
                 try p.err(p.tok_i, .bit_int, .{});
@@ -4206,7 +4259,8 @@ fn directDeclarator(
         };
 
         if (p.eatToken(.ellipsis)) |_| {
-            try p.err(p.tok_i, .param_before_var_args, .{});
+            // Clang allows `f(...)` for functions marked `overloadable`.
+            if (!p.declaratorFollowedByOverloadable()) try p.err(p.tok_i, .param_before_var_args, .{});
             try p.expectClosing(l_paren, .r_paren);
             func_ty.kind = .variadic;
 
@@ -11269,4 +11323,737 @@ test "Node locations" {
         const expected_source_kind = Source.Kind.user;
         try std.testing.expectEqual(expected_source_kind, loc.kind);
     }
+}
+
+// ====== Objective-C ======
+//
+// Only the declarative subset of Objective-C that appears in headers is
+// supported: `@class`, `@protocol`, `@interface` (including categories and
+// class extensions), `@property` and method declarations. Classes and
+// protocols are modelled as opaque struct types; their methods are recorded in
+// `Tree.objc` so that consumers such as translate-c can generate bindings.
+
+const objc_type_qualifiers = std.StaticStringMap(void).initComptime(.{
+    .{"in"},               .{"out"},             .{"inout"},    .{"bycopy"},
+    .{"byref"},            .{"oneway"},          .{"nullable"}, .{"nonnull"},
+    .{"null_unspecified"}, .{"null_resettable"}, .{"__kindof"},
+});
+
+/// Returns the spelling of `tok` if it can be used as an Objective-C selector
+/// piece or directive name, i.e. it is an identifier or a word-like keyword.
+fn objcWordTok(p: *Parser, tok: TokenIndex) ?[]const u8 {
+    switch (p.tok_ids[tok]) {
+        .identifier, .extended_identifier => return p.tokSlice(tok),
+        else => |id| {
+            const lexeme = id.lexeme() orelse return null;
+            if (lexeme.len == 0) return null;
+            if (!std.ascii.isAlphabetic(lexeme[0]) and lexeme[0] != '_') return null;
+            return p.tokSlice(tok);
+        },
+    }
+}
+
+/// The type `id`, as declared by `<objc/objc.h>`, or `void *` if not yet declared.
+fn objcIdType(p: *Parser) !QualType {
+    const id_name = try p.comp.internString("id");
+    if (p.syms.findSymbol(id_name)) |sym| {
+        if (sym.kind == .typedef) return sym.qt;
+    }
+    return .void_pointer;
+}
+
+/// Returns the type of `instancetype`, an Objective-C type parameter or null.
+fn objcSpecialType(p: *Parser, name: StringId) !?QualType {
+    for (p.objc_type_params.items) |param| {
+        if (param == name) return try p.objcIdType();
+    }
+    if (mem.eql(u8, name.lookup(p.comp), "Protocol") and p.syms.findSymbol(name) == null) {
+        // `Protocol` is an implicitly declared class.
+        return try p.objcContainer(p.tok_i, .class);
+    }
+    if (mem.eql(u8, name.lookup(p.comp), "instancetype")) {
+        if (p.syms.findSymbol(name)) |sym| {
+            if (sym.kind == .typedef) return null;
+        }
+        p.objc_saw_instancetype = true;
+        if (p.objc_container) |container_qt| {
+            if (p.tree.objc.get(container_qt)) |container| {
+                if (container.kind == .class) {
+                    return try p.comp.type_store.put(p.comp.gpa, .{ .pointer = .{ .child = container_qt } });
+                }
+            }
+        }
+        return try p.objcIdType();
+    }
+    return null;
+}
+
+/// Get or create the record type representing an Objective-C class or protocol.
+fn objcContainer(p: *Parser, name_tok: TokenIndex, kind: Tree.ObjC.Container.Kind) !QualType {
+    const gpa = p.comp.gpa;
+    const name = try p.comp.internString(p.tokSlice(name_tok));
+    const map = switch (kind) {
+        .class => &p.tree.objc.classes,
+        .protocol => &p.tree.objc.protocols,
+    };
+    if (map.get(name)) |qt| return qt;
+
+    const reserved_index = try p.tree.nodes.addOne(gpa);
+    const record_decl: Node.Index = @fromBackingInt(@intCast(reserved_index));
+    const record_qt = try p.comp.type_store.put(gpa, .{ .@"struct" = .{
+        .name = name,
+        .layout = null,
+        .decl_node = .pack(record_decl),
+        .fields = &.{},
+    } });
+    try p.tree.setNode(.{ .struct_forward_decl = .{
+        .name_or_kind_tok = name_tok,
+        .container_qt = record_qt,
+        .definition = null,
+    } }, reserved_index);
+    try p.decl_buf.append(gpa, record_decl);
+
+    try map.put(gpa, name, record_qt);
+    try p.tree.objc.containers.put(gpa, record_qt.unqualified(), .{
+        .kind = kind,
+        .name = name,
+        .name_tok = name_tok,
+    });
+
+    if (kind == .class) {
+        // Class names can be used as type names.
+        const existing = p.syms.findSymbol(name);
+        if (existing == null) {
+            const typedef_node = try p.addNode(.{ .typedef = .{
+                .name_tok = name_tok,
+                .qt = record_qt,
+                .implicit = false,
+            } });
+            const typedef_qt = try p.comp.type_store.put(gpa, .{ .typedef = .{
+                .base = record_qt,
+                .name = name,
+                .decl_node = typedef_node,
+            } });
+            _ = try p.syms.defineTypedef(p, name, typedef_qt, name_tok, typedef_node);
+            try p.decl_buf.append(gpa, typedef_node);
+        }
+    }
+    return record_qt;
+}
+
+/// Skips a balanced `<...>` sequence starting at the current `<` token.
+fn objcSkipAngles(p: *Parser) void {
+    var depth: i32 = 0;
+    while (true) : (p.tok_i += 1) {
+        switch (p.tok_ids[p.tok_i]) {
+            .angle_bracket_left => depth += 1,
+            .angle_bracket_right => depth -= 1,
+            .angle_bracket_angle_bracket_right => depth -= 2,
+            .eof, .semicolon, .l_brace, .r_brace => return,
+            else => {},
+        }
+        if (depth <= 0) {
+            p.tok_i += 1;
+            return;
+        }
+    }
+}
+
+/// Skips a balanced `{...}` sequence starting at the current `{` token.
+fn objcSkipBraces(p: *Parser) void {
+    var depth: u32 = 0;
+    while (true) : (p.tok_i += 1) {
+        switch (p.tok_ids[p.tok_i]) {
+            .l_brace => depth += 1,
+            .r_brace => {
+                depth -= 1;
+                if (depth == 0) {
+                    p.tok_i += 1;
+                    return;
+                }
+            },
+            .eof => return,
+            else => {},
+        }
+    }
+}
+
+/// Parses `<P1, P2, ...>` starting at the current `<` token.
+fn objcProtocolList(p: *Parser, list: ?*std.ArrayList(QualType)) Error!void {
+    _ = try p.expectToken(.angle_bracket_left);
+    while (true) {
+        const name_tok = try p.expectIdentifier();
+        const protocol_qt = try p.objcContainer(name_tok, .protocol);
+        if (list) |l| {
+            var arena = p.tree.objc.arena.promote(p.comp.gpa);
+            defer p.tree.objc.arena = arena.state;
+            try l.append(arena.allocator(), protocol_qt);
+        }
+        if (p.eatToken(.comma) == null) break;
+    }
+    _ = try p.expectToken(.angle_bracket_right);
+}
+
+/// Called by `typeSpec` after an identifier naming a type when the next token is `<`.
+/// Handles `id<Protocol>` and generic arguments / protocol qualifiers on class types.
+fn objcTypeArgs(p: *Parser, builder: *TypeStore.Builder, name: StringId) Error!void {
+    if (!mem.eql(u8, name.lookup(p.comp), "id")) return p.objcSkipAngles();
+
+    const start = p.tok_i;
+    // Only accept a plain list of identifiers here.
+    var i = start + 1;
+    while (true) : (i += 2) {
+        if (p.tok_ids[i] != .identifier) return p.objcSkipAngles();
+        if (p.tok_ids[i + 1] == .comma) continue;
+        if (p.tok_ids[i + 1] == .angle_bracket_right) break;
+        return p.objcSkipAngles();
+    }
+    var protocols: std.ArrayList(QualType) = .empty;
+    defer protocols.deinit(p.comp.gpa);
+    _ = try p.expectToken(.angle_bracket_left);
+    while (true) {
+        const name_tok = try p.expectIdentifier();
+        try protocols.append(p.comp.gpa, try p.objcContainer(name_tok, .protocol));
+        if (p.eatToken(.comma) == null) break;
+    }
+    _ = try p.expectToken(.angle_bracket_right);
+
+    // Represent `id<P, ...>` as a pointer to the first protocol so that the
+    // protocol's methods can be found from the type.
+    builder.type = .{ .other = try p.comp.type_store.put(p.comp.gpa, .{ .pointer = .{ .child = protocols.items[0] } }) };
+}
+
+/// Skips Objective-C method type qualifiers like `in`, `out`, `nullable`, ...
+fn objcSkipTypeQualifiers(p: *Parser) void {
+    while (p.tok_ids[p.tok_i] == .identifier and objc_type_qualifiers.has(p.tokSlice(p.tok_i))) {
+        p.tok_i += 1;
+    }
+}
+
+/// Parses `'(' typeName ')'` used for method return and parameter types.
+fn objcParenType(p: *Parser) Error!QualType {
+    const l_paren = try p.expectToken(.l_paren);
+    p.objcSkipTypeQualifiers();
+    const qt = qt: {
+        const attr_state = p.wip_attrs.state(true);
+        defer p.wip_attrs.restore(attr_state);
+
+        var qt = (try p.specQual(true)) orelse {
+            try p.err(p.tok_i, .expected_type, .{});
+            return error.ParsingFailed;
+        };
+        qt = try p.wip_attrs.applyTypeAttrs(p, qt);
+        // Parse as an abstract parameter declarator so that qualified arrays
+        // like `(id _Nullable [_Nonnull])` are accepted.
+        if (try p.declarator(qt, .param)) |d| {
+            qt = try p.wip_attrs.applyTypeAttrs(p, d.qt);
+        }
+        break :qt qt;
+    };
+    p.objcSkipTypeQualifiers();
+    try p.expectClosing(l_paren, .r_paren);
+    return qt;
+}
+
+fn objcAddMethod(p: *Parser, container_qt: QualType, method: Tree.ObjC.Method) !void {
+    const container = p.tree.objc.get(container_qt).?;
+    for (container.methods.items) |existing| {
+        if (existing.kind == method.kind and mem.eql(u8, existing.selector, method.selector)) return;
+    }
+    var arena = p.tree.objc.arena.promote(p.comp.gpa);
+    defer p.tree.objc.arena = arena.state;
+    try container.methods.append(arena.allocator(), method);
+}
+
+/// Top level Objective-C declaration, starting with `@`.
+fn objcDecl(p: *Parser) Error!bool {
+    if (!p.comp.langopts.objc) return false;
+    // Objective-C declarations may be preceded by `extern` and attributes,
+    // e.g. `OBJC_EXPORT @interface ...`.
+    const start = p.tok_i;
+    while (true) switch (p.tok_ids[p.tok_i]) {
+        .keyword_extern => p.tok_i += 1,
+        .keyword_attribute1, .keyword_attribute2 => try p.attributeSpecifier(),
+        else => break,
+    };
+    if (p.tok_ids[p.tok_i] != .at_sign) {
+        p.tok_i = start;
+        return false;
+    }
+    const at = p.tok_i;
+    const keyword = p.objcWordTok(at + 1) orelse {
+        try p.err(at, .objc_expected_directive, .{});
+        p.tok_i += 1;
+        return error.ParsingFailed;
+    };
+    p.tok_i += 2;
+
+    if (mem.eql(u8, keyword, "class")) {
+        while (true) {
+            const name_tok = try p.expectIdentifier();
+            _ = try p.objcContainer(name_tok, .class);
+            if (p.tok_ids[p.tok_i] == .angle_bracket_left) p.objcSkipAngles();
+            if (p.eatToken(.comma) == null) break;
+        }
+        _ = try p.expectToken(.semicolon);
+    } else if (mem.eql(u8, keyword, "protocol")) {
+        const name_tok = try p.expectIdentifier();
+        if (p.tok_ids[p.tok_i] == .comma or p.tok_ids[p.tok_i] == .semicolon) {
+            // Forward declaration(s).
+            _ = try p.objcContainer(name_tok, .protocol);
+            while (p.eatToken(.comma)) |_| {
+                _ = try p.objcContainer(try p.expectIdentifier(), .protocol);
+            }
+            _ = try p.expectToken(.semicolon);
+            return true;
+        }
+        const protocol_qt = try p.objcContainer(name_tok, .protocol);
+        p.tree.objc.get(protocol_qt).?.defined = true;
+        if (p.tok_ids[p.tok_i] == .angle_bracket_left) {
+            try p.objcProtocolList(&p.tree.objc.get(protocol_qt).?.protocols);
+        }
+        try p.objcBody(protocol_qt);
+    } else if (mem.eql(u8, keyword, "interface")) {
+        try p.objcInterface();
+    } else if (mem.eql(u8, keyword, "compatibility_alias")) {
+        const alias_tok = try p.expectIdentifier();
+        const class_tok = try p.expectIdentifier();
+        const class_qt = try p.objcContainer(class_tok, .class);
+        _ = try p.expectToken(.semicolon);
+
+        const gpa = p.comp.gpa;
+        const alias_name = try p.comp.internString(p.tokSlice(alias_tok));
+        const typedef_node = try p.addNode(.{ .typedef = .{
+            .name_tok = alias_tok,
+            .qt = class_qt,
+            .implicit = false,
+        } });
+        const typedef_qt = try p.comp.type_store.put(gpa, .{ .typedef = .{
+            .base = class_qt,
+            .name = alias_name,
+            .decl_node = typedef_node,
+        } });
+        _ = try p.syms.defineTypedef(p, alias_name, typedef_qt, alias_tok, typedef_node);
+        try p.decl_buf.append(gpa, typedef_node);
+    } else if (mem.eql(u8, keyword, "implementation") or mem.eql(u8, keyword, "import")) {
+        try p.err(at, .objc_unsupported_directive, .{keyword});
+        return error.ParsingFailed;
+    } else {
+        try p.err(at, .objc_unknown_directive, .{keyword});
+        return error.ParsingFailed;
+    }
+    return true;
+}
+
+/// `@interface` was just consumed.
+fn objcInterface(p: *Parser) Error!void {
+    const name_tok = try p.expectIdentifier();
+    const class_qt = try p.objcContainer(name_tok, .class);
+
+    const type_params_start = p.objc_type_params.items.len;
+    defer p.objc_type_params.shrinkRetainingCapacity(type_params_start);
+
+    // Generic type parameters: `<__covariant ObjectType : Bound, ...>`
+    if (p.eatToken(.angle_bracket_left)) |_| {
+        while (true) {
+            while (p.tok_ids[p.tok_i] == .identifier and
+                (mem.eql(u8, p.tokSlice(p.tok_i), "__covariant") or mem.eql(u8, p.tokSlice(p.tok_i), "__contravariant")))
+            {
+                p.tok_i += 1;
+            }
+            const param_tok = try p.expectIdentifier();
+            try p.objc_type_params.append(p.comp.gpa, try p.comp.internString(p.tokSlice(param_tok)));
+            if (p.eatToken(.colon)) |_| {
+                // Skip the bound.
+                var depth: i32 = 0;
+                while (true) : (p.tok_i += 1) switch (p.tok_ids[p.tok_i]) {
+                    .angle_bracket_left, .l_paren => depth += 1,
+                    .r_paren => depth -= 1,
+                    .angle_bracket_right => {
+                        if (depth == 0) break;
+                        depth -= 1;
+                    },
+                    .angle_bracket_angle_bracket_right => {
+                        if (depth == 1) {
+                            // Split `>>`; the second half closes the parameter list.
+                            p.tok_i += 1;
+                            p.objc_type_params_closed = true;
+                            break;
+                        }
+                        depth -= 2;
+                    },
+                    .comma => if (depth == 0) break,
+                    .eof, .semicolon => return error.ParsingFailed,
+                    else => {},
+                };
+            }
+            if (p.objc_type_params_closed) {
+                p.objc_type_params_closed = false;
+                break;
+            }
+            if (p.eatToken(.comma) == null) {
+                _ = try p.expectToken(.angle_bracket_right);
+                break;
+            }
+        }
+    }
+
+    const container = p.tree.objc.get(class_qt).?;
+    if (p.eatToken(.l_paren)) |l_paren| {
+        // Category or class extension.
+        _ = try p.eatIdentifier();
+        try p.expectClosing(l_paren, .r_paren);
+    } else {
+        container.defined = true;
+        if (p.eatToken(.colon)) |_| {
+            const super_tok = try p.expectIdentifier();
+            const super_qt = try p.objcContainer(super_tok, .class);
+            p.tree.objc.get(class_qt).?.superclass = super_qt;
+            if (p.tok_ids[p.tok_i] == .angle_bracket_left) {
+                // Either type arguments for the superclass or a protocol list.
+                if (p.tok_ids[p.tok_i + 1] == .identifier and p.tree.objc.protocols.contains(try p.comp.internString(p.tokSlice(p.tok_i + 1))) and
+                    p.syms.findSymbol(try p.comp.internString(p.tokSlice(p.tok_i + 1))) == null)
+                {
+                    // protocol list, handled below
+                } else {
+                    p.objcSkipAngles();
+                }
+            }
+        }
+    }
+    if (p.tok_ids[p.tok_i] == .angle_bracket_left) {
+        try p.objcProtocolList(&p.tree.objc.get(class_qt).?.protocols);
+    }
+    // Instance variables.
+    if (p.tok_ids[p.tok_i] == .l_brace) p.objcSkipBraces();
+
+    try p.objcBody(class_qt);
+}
+
+/// Parses the members of an `@interface` or `@protocol` up to and including `@end`.
+fn objcBody(p: *Parser, container_qt: QualType) Error!void {
+    const saved_container = p.objc_container;
+    defer p.objc_container = saved_container;
+    p.objc_container = container_qt;
+
+    var optional = false;
+    while (true) {
+        if (try p.pragma()) continue;
+        const member_start = p.tok_i;
+        const attr_state = p.wip_attrs.state(true);
+        defer p.wip_attrs.restore(attr_state);
+
+        const res = switch (p.tok_ids[p.tok_i]) {
+            .eof => {
+                try p.err(p.tok_i, .objc_missing_end, .{});
+                return error.ParsingFailed;
+            },
+            .semicolon => {
+                p.tok_i += 1;
+                continue;
+            },
+            .minus, .plus => p.objcMethod(container_qt, optional),
+            .at_sign => blk: {
+                const keyword = p.objcWordTok(p.tok_i + 1) orelse {
+                    try p.err(p.tok_i, .objc_expected_directive, .{});
+                    p.tok_i += 1;
+                    continue;
+                };
+                if (mem.eql(u8, keyword, "end")) {
+                    p.tok_i += 2;
+                    return;
+                } else if (mem.eql(u8, keyword, "optional")) {
+                    optional = true;
+                    p.tok_i += 2;
+                    continue;
+                } else if (mem.eql(u8, keyword, "required")) {
+                    optional = false;
+                    p.tok_i += 2;
+                    continue;
+                } else if (mem.eql(u8, keyword, "property")) {
+                    p.tok_i += 2;
+                    break :blk p.objcProperty(container_qt, optional);
+                } else {
+                    try p.err(p.tok_i, .objc_unknown_directive, .{keyword});
+                    p.tok_i += 2;
+                    break :blk error.ParsingFailed;
+                }
+            },
+            else => blk: {
+                // Attributes may precede a member; plain C declarations are also allowed.
+                p.attributeSpecifier() catch |e| break :blk e;
+                switch (p.tok_ids[p.tok_i]) {
+                    .minus, .plus, .at_sign => continue,
+                    else => {},
+                }
+                if (p.tok_i != member_start and p.tok_ids[p.tok_i] == .semicolon) continue;
+                const saved_decl_len = p.decl_buf.items.len;
+                _ = saved_decl_len;
+                if (p.decl() catch |e| break :blk e) continue;
+                try p.err(p.tok_i, .expected_external_decl, .{});
+                break :blk error.ParsingFailed;
+            },
+        };
+        res catch |e| switch (e) {
+            error.ParsingFailed => p.objcRecover(),
+            else => |er| return er,
+        };
+    }
+}
+
+/// Skips to the end of the current Objective-C member declaration.
+fn objcRecover(p: *Parser) void {
+    var depth: u32 = 0;
+    while (true) : (p.tok_i += 1) switch (p.tok_ids[p.tok_i]) {
+        .l_paren, .l_brace, .l_bracket => depth += 1,
+        .r_paren, .r_brace, .r_bracket => depth -|= 1,
+        .semicolon => if (depth == 0) {
+            p.tok_i += 1;
+            return;
+        },
+        .at_sign => if (depth == 0) return,
+        .eof => return,
+        else => {},
+    };
+}
+
+/// Method declaration starting at `-` or `+`.
+fn objcMethod(p: *Parser, container_qt: QualType, optional: bool) Error!void {
+    const gpa = p.comp.gpa;
+    const kind_tok = p.tok_i;
+    const is_class_method = p.tok_ids[kind_tok] == .plus;
+    p.tok_i += 1;
+
+    p.objc_saw_instancetype = false;
+    const return_qt = if (p.tok_ids[p.tok_i] == .l_paren) try p.objcParenType() else try p.objcIdType();
+    const returns_instancetype = p.objc_saw_instancetype;
+
+    var selector: std.ArrayList(u8) = .empty;
+    defer selector.deinit(gpa);
+    var params: std.ArrayList(Tree.ObjC.Param) = .empty;
+    defer params.deinit(gpa);
+    var variadic = false;
+    var unsupported = false;
+
+    const name_tok = p.tok_i;
+    if (p.objcWordTok(p.tok_i)) |piece| {
+        try selector.appendSlice(gpa, piece);
+        p.tok_i += 1;
+    } else if (p.tok_ids[p.tok_i] != .colon) {
+        try p.err(p.tok_i, .objc_expected_selector, .{});
+        return error.ParsingFailed;
+    }
+
+    if (p.eatToken(.colon)) |_| {
+        while (true) {
+            try selector.append(gpa, ':');
+            const param_qt = if (p.tok_ids[p.tok_i] == .l_paren) try p.objcParenType() else try p.objcIdType();
+            try p.attributeSpecifier();
+            const param_name = p.objcWordTok(p.tok_i) orelse {
+                try p.err(p.tok_i, .expected_identifier, .{});
+                return error.ParsingFailed;
+            };
+            p.tok_i += 1;
+            try p.attributeSpecifier();
+            try params.append(gpa, .{ .name = param_name, .qt = try param_qt.decay(p.comp) });
+
+            if (p.objcWordTok(p.tok_i)) |piece| {
+                if (p.tok_ids[p.tok_i + 1] == .colon) {
+                    try selector.appendSlice(gpa, piece);
+                    p.tok_i += 2;
+                    continue;
+                }
+            }
+            if (p.eatToken(.colon)) |_| continue;
+            break;
+        }
+        while (p.eatToken(.comma)) |_| {
+            if (p.eatToken(.ellipsis)) |_| {
+                variadic = true;
+                break;
+            }
+            // C-style trailing parameters are not supported; skip them.
+            unsupported = true;
+            while (true) : (p.tok_i += 1) switch (p.tok_ids[p.tok_i]) {
+                .comma, .semicolon, .l_brace, .eof => break,
+                else => {},
+            };
+        }
+    }
+
+    try p.attributeSpecifier();
+    const unavailable = p.objcHasUnavailableAttr();
+    if (p.tok_ids[p.tok_i] == .l_brace) {
+        p.objcSkipBraces();
+    } else {
+        _ = try p.expectToken(.semicolon);
+    }
+    if (unsupported or unavailable) return;
+
+    var arena = p.tree.objc.arena.promote(gpa);
+    defer p.tree.objc.arena = arena.state;
+    try p.objcAddMethod(container_qt, .{
+        .selector = try arena.allocator().dupe(u8, selector.items),
+        .kind = if (is_class_method) .class else .instance,
+        .return_qt = return_qt,
+        .params = try arena.allocator().dupe(Tree.ObjC.Param, params.items),
+        .variadic = variadic,
+        .optional = optional,
+        .property = false,
+        .returns_instancetype = returns_instancetype,
+        .tok = name_tok,
+    });
+}
+
+fn objcHasUnavailableAttr(p: *Parser) bool {
+    for (p.wip_attrs.attrs.items) |parsed| {
+        switch (parsed.name) {
+            .clang => |clang| if (clang == .unavailable) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// `@property` was just consumed.
+fn objcProperty(p: *Parser, container_qt: QualType, optional: bool) Error!void {
+    const gpa = p.comp.gpa;
+    var readonly = false;
+    var class_property = false;
+    var getter: ?[]const u8 = null;
+    var setter: ?[]const u8 = null;
+
+    if (p.eatToken(.l_paren)) |l_paren| {
+        while (p.tok_ids[p.tok_i] != .r_paren) {
+            // Attributes may expand to nothing, e.g. `(class, NS_NONATOMIC_IOSONLY, copy)`.
+            if (p.eatToken(.comma)) |_| continue;
+            const attr = p.objcWordTok(p.tok_i) orelse {
+                try p.err(p.tok_i, .expected_identifier, .{});
+                return error.ParsingFailed;
+            };
+            p.tok_i += 1;
+            if (p.eatToken(.equal)) |_| {
+                const value = p.objcWordTok(p.tok_i) orelse {
+                    try p.err(p.tok_i, .expected_identifier, .{});
+                    return error.ParsingFailed;
+                };
+                p.tok_i += 1;
+                if (mem.eql(u8, attr, "getter")) {
+                    getter = value;
+                } else if (mem.eql(u8, attr, "setter")) {
+                    _ = p.eatToken(.colon);
+                    setter = value;
+                }
+            } else if (mem.eql(u8, attr, "readonly")) {
+                readonly = true;
+            } else if (mem.eql(u8, attr, "class")) {
+                class_property = true;
+            }
+            if (p.eatToken(.comma) == null) break;
+        }
+        try p.expectClosing(l_paren, .r_paren);
+    }
+
+    try p.attributeSpecifier();
+    const decl_spec = (try p.declSpec()) orelse {
+        try p.err(p.tok_i, .expected_type, .{});
+        return error.ParsingFailed;
+    };
+
+    var arena = p.tree.objc.arena.promote(gpa);
+    defer p.tree.objc.arena = arena.state;
+    const allocator = arena.allocator();
+
+    while (true) {
+        const d = (try p.declarator(decl_spec.qt, .normal)) orelse {
+            try p.err(p.tok_i, .expected_identifier, .{});
+            return error.ParsingFailed;
+        };
+        try p.attributeSpecifier();
+        const unavailable = p.objcHasUnavailableAttr();
+        const name = p.tokSlice(d.name);
+        const kind: @FieldType(Tree.ObjC.Method, "kind") = if (class_property) .class else .instance;
+
+        if (!unavailable) {
+            try p.objcAddMethod(container_qt, .{
+                .selector = try allocator.dupe(u8, getter orelse name),
+                .kind = kind,
+                .return_qt = d.qt,
+                .params = &.{},
+                .variadic = false,
+                .optional = optional,
+                .property = true,
+                .tok = d.name,
+            });
+            if (!readonly) {
+                const setter_name = if (setter) |s|
+                    try std.fmt.allocPrint(allocator, "{s}:", .{s})
+                else
+                    try std.fmt.allocPrint(allocator, "set{c}{s}:", .{ std.ascii.toUpper(name[0]), name[1..] });
+                const params = try allocator.alloc(Tree.ObjC.Param, 1);
+                params[0] = .{ .name = name, .qt = try d.qt.decay(p.comp) };
+                try p.objcAddMethod(container_qt, .{
+                    .selector = setter_name,
+                    .kind = kind,
+                    .return_qt = .void,
+                    .params = params,
+                    .variadic = false,
+                    .optional = optional,
+                    .property = true,
+                    .tok = d.name,
+                });
+            }
+        }
+        if (p.eatToken(.comma) == null) break;
+    }
+    _ = try p.expectToken(.semicolon);
+}
+
+/// Returns true if the balanced `{...}` starting at the current token contains
+/// Objective-C expression syntax such as message sends or `@` literals.
+fn objcBodyHasObjCSyntax(p: *Parser) bool {
+    var depth: u32 = 0;
+    var i = p.tok_i;
+    while (true) : (i += 1) {
+        switch (p.tok_ids[i]) {
+            .l_brace => depth += 1,
+            .r_brace => {
+                depth -= 1;
+                if (depth == 0) return false;
+            },
+            .at_sign => return true,
+            .l_bracket => switch (p.tok_ids[i - 1]) {
+                // Array subscripts follow an expression; anything else starts a message send.
+                .identifier, .extended_identifier, .r_paren, .r_bracket, .string_literal => {},
+                else => return true,
+            },
+            .eof => return false,
+            else => {},
+        }
+    }
+}
+
+fn hasOverloadableAttr(p: *Parser) bool {
+    for (p.wip_attrs.attrs.items) |parsed| switch (parsed.name) {
+        .clang => |clang_attr| if (clang_attr == .overloadable) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Looks ahead to the end of the current declaration for an `overloadable` attribute.
+fn declaratorFollowedByOverloadable(p: *Parser) bool {
+    var depth: u32 = 0;
+    var i = p.tok_i;
+    while (true) : (i += 1) switch (p.tok_ids[i]) {
+        .l_paren => depth += 1,
+        .r_paren => depth -|= 1,
+        .semicolon, .l_brace, .eof => return false,
+        .comma => if (depth == 0) return false,
+        .identifier, .extended_identifier => {
+            const name = p.tokSlice(i);
+            if (mem.eql(u8, name, "overloadable") or mem.eql(u8, name, "__overloadable__")) return true;
+        },
+        else => {},
+    };
 }
